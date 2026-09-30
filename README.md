@@ -1,6 +1,6 @@
 # 公共交通票价结算 API
 
-基于 FastAPI + SQLite 的公交/地铁票价结算与换乘网络校验服务。客户端提交刷卡事件，服务按事件时间配对行程，依据可配置的分区票价、换乘优惠以及 UTC 自然日 / 自然周（ISO 周，周一起算）封顶规则计算应收金额；迟到或更正的记录会触发受影响乘客全量重算并返回每段行程的计费依据与调账差额。此外提供 `POST /reconciliations` 扣款对账接口，按出站时间快照内部行程费用，与外部扣款明细进行批次化一对一核对。`POST /network/validate` 还可对带生效时间的换乘网络（线路段 + 步行换乘边）按时间边界切片构图，校验枢纽可达性、双向换乘对称性、重复 / 自环边与重叠生效区间；通过的版本可用 `POST /network/snapshots` 固化并随时查询。票价争议通过 `POST /disputes` 提起（创建时冻结行程收费快照、申请额不得超过快照应收）、`POST /disputes/{id}/resolve` 凭乐观版本一次性结案并写入不可变退款流水；结案后若行程因事件更正而重算，`GET /disputes/{id}` 会实时报告待补退 / 待追回差额而不覆盖已结退款。此外提供 `POST /event-quality/scans` 刷卡事件质量扫描：在 UTC 半开区间内按 `(occurred_at, seq)` 扫描事件，识别窗口内重复同类刷卡与出站后未达到站点最短行程秒数便再次进站的时序冲突，结果只写入独立的只追加表，可随时用 `GET /event-quality/scans/{id}` 查询，绝不改动事件、行程、账单或审计。最后提供 `POST /privacy/exports` 匿名出行轨迹导出：在 UTC 半开区间（按进站时间）内读取行程，用服务器配置的 `PRIVACY_SALT` 对 `passenger_id` 做稳定 HMAC 假名化（同一乘客跨多段行程、跨多次导出保持同一假名），按（纪元对齐的 UTC 时间桶、起点站组、终点站组）统计去重乘客数，等价类人数不足最小群体 `k` 时**整组抑制**（不逐行泄露），只返回保留行程的假名 / 时间桶 / 站点组；结果只追加保存，相同 `export_id` 同载荷幂等、不同载荷 `409`，可用 `GET /privacy/exports/{id}` 查询。突发中断时可调用 `POST /disruption/replans` 疏运重排：提交最小换乘秒数、按站序排列（含 UTC 到发时刻与核定容量）的替代班次和必须整体成行的乘客组（origin / destination / ready_at / 人数），服务按 `(ready_at, group_id)` 依次在各相邻区段剩余容量约束下为每组选出**最早到达**行程（同到达再取换乘更少、班次 ID 序列字典序更小者），分配后逐段扣减容量，无法成行则给出滞留原因；班次时刻校验失败不落库，结果冻结保存，相同 `replan_id` 同载荷幂等、不同载荷 `409`，可用 `GET /disruption/replans/{id}` 查询。
+基于 FastAPI + SQLite 的公交/地铁票价结算与换乘网络校验服务。客户端提交刷卡事件，服务按事件时间配对行程，依据可配置的分区票价、换乘优惠以及 UTC 自然日 / 自然周（ISO 周，周一起算）封顶规则计算应收金额；迟到或更正的记录会触发受影响乘客全量重算并返回每段行程的计费依据与调账差额。此外提供 `POST /reconciliations` 扣款对账接口，按出站时间快照内部行程费用，与外部扣款明细进行批次化一对一核对。`POST /network/validate` 还可对带生效时间的换乘网络（线路段 + 步行换乘边）按时间边界切片构图，校验枢纽可达性、双向换乘对称性、重复 / 自环边与重叠生效区间；通过的版本可用 `POST /network/snapshots` 固化并随时查询。票价争议通过 `POST /disputes` 提起（创建时冻结行程收费快照、申请额不得超过快照应收）、`POST /disputes/{id}/resolve` 凭乐观版本一次性结案并写入不可变退款流水；结案后若行程因事件更正而重算，`GET /disputes/{id}` 会实时报告待补退 / 待追回差额而不覆盖已结退款。此外提供 `POST /event-quality/scans` 刷卡事件质量扫描：在 UTC 半开区间内按 `(occurred_at, seq)` 扫描事件，识别窗口内重复同类刷卡与出站后未达到站点最短行程秒数便再次进站的时序冲突，结果只写入独立的只追加表，可随时用 `GET /event-quality/scans/{id}` 查询，绝不改动事件、行程、账单或审计。最后提供 `POST /privacy/exports` 匿名出行轨迹导出：在 UTC 半开区间（按进站时间）内读取行程，用服务器配置的 `PRIVACY_SALT` 对 `passenger_id` 做稳定 HMAC 假名化（同一乘客跨多段行程、跨多次导出保持同一假名），按（纪元对齐的 UTC 时间桶、起点站组、终点站组）统计去重乘客数，等价类人数不足最小群体 `k` 时**整组抑制**（不逐行泄露），只返回保留行程的假名 / 时间桶 / 站点组；结果只追加保存，相同 `export_id` 同载荷幂等、不同载荷 `409`，可用 `GET /privacy/exports/{id}` 查询。突发中断时可调用 `POST /disruption/replans` 疏运重排：提交最小换乘秒数、按站序排列（含 UTC 到发时刻与核定容量）的替代班次和必须整体成行的乘客组（origin / destination / ready_at / 人数），服务按 `(ready_at, group_id)` 依次在各相邻区段剩余容量约束下为每组选出**最早到达**行程（同到达再取换乘更少、班次 ID 序列字典序更小者），分配后逐段扣减容量，无法成行则给出滞留原因；班次时刻校验失败不落库，结果冻结保存，相同 `replan_id` 同载荷幂等、不同载荷 `409`，可用 `GET /disruption/replans/{id}` 查询。此外提供 `POST /clearings` 运营方票款清分：调用方提交清分号、按出站时间（`ended_at`）计算的 UTC 半开结算区间以及按起终点站配置的运营方万分比分摊规则（每条规则份额合计必须恰为 10000，区间内存在匹配不到规则的行程则整批拒绝）；首次关账即冻结区间与规则，按当前行程实收以最大余数法（余数降序、运营方 ID 升序处理分不净）拆分并写入不可变流水。刷卡更正导致行程金额、站点或配对关系变化时，已关账流水绝不改写；后续批次用新的 `clearing_id` 引用首次关账，只追加"当前应分 − 历次累计"的正负差额（行程消失也全额冲回），重复调整不会重复入账。批次与明细同事务原子提交，相同 `clearing_id` 同载荷幂等、异载荷 `409`，可用 `GET /clearings/{id}` 查询冻结结果。
 
 ## 启动
 
@@ -33,6 +33,7 @@ SQLite 数据文件持久化在 `transit-data` 卷中（容器内路径 `/data/t
   - 任何新记录（包括迟到记录）都会触发该乘客全量确定性重算，响应中的 `adjustments` 列出每段行程的 `old/new/delta` 金额与完整计费依据 `basis`；配对关系变化导致行程消失时会返回金额为负的冲正调账。
 - **金额单位**：所有金额均为整数分（cents），货币见配置 `currency`。
 - **票价争议与退款**：`POST /disputes` 创建时冻结行程当时的收费快照，申请退款额不得超过快照应收；`POST /disputes/{id}/resolve` 凭乐观版本（open 为 1、结案后为 2）一次性结案，同事务写入一条不可变退款流水（存储层触发器禁止更新/删除）。结案后行程若因事件更正而重算，`GET /disputes/{id}` 按"快照应收 − 已退金额 = 乘客净付"与当前应收对比，报告待补退（`top_up_due`）或待追回（`clawback_due`）差额；差额仅报告，已结退款绝不被覆盖。相同请求幂等，版本冲突返回 `409`。
+- **运营方票款清分**：首次关账冻结 UTC 半开区间（按出站时间 `ended_at`）与万分比规则；区间内每个起讫站对都必须有规则、每条规则份额合计必须恰为 10000，否则整批 `422` 拒绝、不落任何记录。每笔实收按规则拆分，除不尽的分按小数余数降序、余数相同再按运营方 ID 升序逐分分配（最大余数法），拆分明细之和恒等于行程金额。首次流水不可变（禁止更新/删除）；更正后的追补批次用新的 `clearing_id` 引用首次关账，沿用冻结区间与规则，以当前应分金额减去该（行程, 运营方）历次累计净额，**只追加非零正负差额**，行程消失也全额冲回；重复提交同一调整不会重复入账。批次与明细同事务原子提交，相同 `clearing_id` 同载荷幂等、异载荷 `409`。
 
 ## 接口
 
@@ -402,6 +403,132 @@ curl http://localhost:8000/disputes/disp-2026-09-27-0001
 
 争议不存在返回 `404`。
 
+### `POST /clearings` — 运营方票款清分（首次关账 / 更正追补）
+
+调用方提交清分号 `clearing_id`、按出站时间（行程 `ended_at`）计算的 UTC 半开结算区间 `[window_start, window_end)`，以及按**起讫站对**配置的运营方万分比分摊规则 `rules`（`shares` 中各运营方 `basis_points` 之和必须恰为 `10000`）。
+
+#### 首次清分（冻结关账）
+
+```bash
+curl -X POST http://localhost:8000/clearings \
+  -H "Content-Type: application/json" \
+  -d '{
+    "clearing_id": "clr-2026-12-07-a",
+    "window_start": "2026-12-07T00:00:00Z",
+    "window_end": "2026-12-08T00:00:00Z",
+    "rules": [
+      {
+        "from_station": "S01",
+        "to_station": "S04",
+        "shares": [
+          {"operator_id": "OP-A", "basis_points": 5000},
+          {"operator_id": "OP-B", "basis_points": 5000}
+        ]
+      },
+      {
+        "from_station": "S05",
+        "to_station": "S06",
+        "shares": [
+          {"operator_id": "OP-A", "basis_points": 3333},
+          {"operator_id": "OP-B", "basis_points": 3333},
+          {"operator_id": "OP-C", "basis_points": 3334}
+        ]
+      },
+      {
+        "from_station": "S01",
+        "to_station": "S07",
+        "shares": [
+          {"operator_id": "OP-A", "basis_points": 7000},
+          {"operator_id": "OP-C", "basis_points": 3000}
+        ]
+      }
+    ]
+  }'
+```
+
+首次关账时服务**冻结该区间与规则**，读取区间内当前所有行程的实收（`trip_charges.amount_cents`，按出站时间落入半开区间；恰在 `window_start` 出站的行程计入，恰在 `window_end` 出站的不计入），逐笔按对应站对规则拆分：
+
+- **分不净的处理（最大余数法）**：各运营方先取 `floor(金额 × 份额 / 10000)` 的整数分，剩余的分按小数余数从大到小逐分补发；余数相同则按 `operator_id` 升序补发。因此每行明细之和恒等于行程实收金额。例如 200 分按 3333/3333/3334 拆分为 OP-A 67、OP-B 66、OP-C 67。
+- **整批拒绝**：区间内只要有行程的起讫站对匹配不到规则，或某条规则的份额合计不等于 10000（含重复站对规则、规则内重复运营方），整批返回 `422`，批次与明细均不落库；区间为空（`window_end <= window_start`）或缺区间、缺规则同样 `422`。
+- 批次（`clearing_batches`）与明细（`clearing_entries`）在**同一 SQLite 事务**内原子提交，并追加一条 `clearing_closed` 审计记录；两张表均带禁止 `UPDATE` / `DELETE` 的触发器，**已关账流水不可改写**。
+
+响应（节选）：
+
+```json
+{
+  "clearing_id": "clr-2026-12-07-a",
+  "status": "created",
+  "kind": "initial",
+  "initial_clearing_id": "clr-2026-12-07-a",
+  "chain_seq": 1,
+  "window_start": "2026-12-07T00:00:00Z",
+  "window_end": "2026-12-08T00:00:00Z",
+  "currency": "CNY",
+  "rules": [ "...冻结的规范化规则（站对、运营方均排序）..." ],
+  "trip_count": 6,
+  "total_cents": 2800,
+  "entry_count": 14,
+  "entries": [
+    {
+      "clearing_id": "clr-2026-12-07-a",
+      "seq": 0,
+      "trip_id": "evt-1:evt-2",
+      "from_station": "S01",
+      "to_station": "S04",
+      "operator_id": "OP-A",
+      "delta_cents": 250,
+      "current_amount_cents": 500,
+      "cumulative_amount_cents": 250,
+      "created_at": "2026-12-08T02:00:00Z"
+    }
+  ]
+}
+```
+
+明细按 `(trip_id, operator_id)` 排序。首次关账的每行 `delta_cents` 就是该运营方分得的全额，`cumulative_amount_cents` 同值。
+
+#### 更正后追补（后续批次）
+
+刷卡更正（`POST /events` 以同一 `event_id` 提交不同内容）可能改变行程的**金额、站点或配对关系**。已关账流水绝不改写；需要追补时，提交一个**新的** `clearing_id`，并以 `initial_clearing_id` 引用首次关账。追补批次不携带区间与规则（携带则 `422`），而是沿用首次关账冻结的副本：
+
+```bash
+curl -X POST http://localhost:8000/clearings \
+  -H "Content-Type: application/json" \
+  -d '{
+    "clearing_id": "clr-2026-12-07-b",
+    "initial_clearing_id": "clr-2026-12-07-a"
+  }'
+```
+
+服务重新读取区间内当前行程并按冻结规则拆分，对每个 `(行程, 运营方)` 取：
+
+```
+本批追加 delta = 当前应分金额 − 该链历次已入账累计净额
+```
+
+只追加 `delta != 0` 的有符号流水（`delta_cents` 为正表示补充分摊、为负表示冲回），并写入新的累计净额 `cumulative_amount_cents`：
+
+- **金额变化**（站对不变）：如 300 分变为 200 分，原拆账 100/100/100、新拆账 67/66/67，则追加 OP-A −33、OP-B −34、OP-C −33。
+- **站点变化**：原站对的运营方若不在新站对规则中，其历史份额**全额冲回**；新站对规则中的运营方按新金额入账。例如 S01→S04（500 按 50/50）更正为 S01→S07（800 按 70/30）：OP-A +310（560−250）、OP-B −250、OP-C +240。
+- **配对关系变化 / 行程消失**：原行程在区间内不再存在（如出站事件与其他进站重新配对）时，其全部历史份额按运营方**全额冲回**（累计净额归零，`current_amount_cents` 记 0）；新配对出的行程按其站对规则正常入账。新行程站对若没有冻结规则匹配，整批同样 `422` 拒绝（旧流水不受影响）。
+- **重复调整不重复入账**：再次提交完全相同的追补请求返回已存批次（`status="duplicate"`），不新增任何流水；没有任何差额时批次仍会创建，但 `entries` 为空、`entry_count=0`。
+
+响应中 `kind="adjustment"`、`chain_seq` 为 2、3、…（首次关账为 1），`initial_clearing_id` 指向首次关账。引用不存在的 `initial_clearing_id`、或引用的不是首次关账（而是另一个追补批次）均返回 `422`。
+
+#### 幂等、冲突与查询
+
+- 相同 `clearing_id` + 相同规范化载荷（时间归一化为 UTC、规则按站对与运营方 ID 排序，数组顺序与时区写法不影响身份）重复提交 → 返回已存结果，`status="duplicate"`，冻结内容不重算；
+- 相同 `clearing_id` + 不同载荷 → `409`；
+- `GET /clearings/{clearing_id}` 返回该批次冻结的区间、规则、统计与明细（`status` 固定为 `"created"`）；不存在返回 `404`。首次关账的查询结果永远是当时那 14 行初始流水，后续追补与刷卡更正都不会改变它。
+
+```bash
+# 查询首次清分的冻结结果
+curl http://localhost:8000/clearings/clr-2026-12-07-a
+
+# 刷卡更正后提交追补批次（新 clearing_id 引用首次关账），再查询追补流水
+curl http://localhost:8000/clearings/clr-2026-12-07-b
+```
+
 ### `POST /event-quality/scans` — 刷卡事件质量扫描
 
 调用方提交扫描号 `scan_id`、UTC 半开区间 `[window_start, window_end)`（作用于事件的 `occurred_at`）、可选乘客白名单 `passengers`、**重复刷卡时间窗** `duplicate_window_seconds`（秒）以及**站点间最短行程秒数映射** `min_travel_seconds`（有向，形如 `{"出站站": {"进站站": 秒数}}`）。服务只读取 `events`，对区间内事件按乘客分组、按 `(occurred_at, seq)` 排序，逐条与该乘客的**上一条事件**比对，识别两类告警：
@@ -677,7 +804,8 @@ curl http://localhost:8000/disruption/replans/dr-2026-09-27-a
 - 对账批次创建成功 → `recon_batch_created`；
 - 网络校验首次提交成功（无论是否通过）→ `network_validated`；网络快照固化成功 → `network_snapshot_created`；
 - 争议创建成功（冻结收费快照）→ `dispute_opened`；争议结案成功（写入不可变退款流水）→ `dispute_resolved`；
-- **重复请求不产生审计记录**：事件幂等重复（`duplicate`）、批次幂等重复（`duplicate`）、网络校验 / 快照幂等重复、争议 / 结案幂等重复（`duplicate`）、冲突（`409`）与校验失败（`422`）均不追加；
+- 票款清分关账成功（首次关账或更正追补批次，含其不可变流水明细）→ `clearing_closed`；
+- **重复请求不产生审计记录**：事件幂等重复（`duplicate`）、批次幂等重复（`duplicate`）、网络校验 / 快照幂等重复、争议 / 结案幂等重复（`duplicate`）、清分幂等重复（`duplicate`）、冲突（`409`）与校验失败（`422`）均不追加；
 - **只读分析不产生审计记录**：`POST /event-quality/scans` 只写其独立的只追加扫描表，`POST /privacy/exports` 只写其独立的只追加匿名导出表，`POST /disruption/replans` 只写其独立的只追加重排表；三者都不触碰 `audit_log`，也不改动事件、行程、账单或争议数据；
 - 审计与业务数据同事务提交：业务写入（或审计写入）失败时一并回滚，不留半截记录。
 
@@ -687,7 +815,7 @@ curl http://localhost:8000/disruption/replans/dr-2026-09-27-a
 
 可选查询参数：
 
-- `operation`：按操作类型过滤（`event_processed` / `event_corrected` / `recon_batch_created` / `network_validated` / `network_snapshot_created` / `dispute_opened` / `dispute_resolved`）；
+- `operation`：按操作类型过滤（`event_processed` / `event_corrected` / `recon_batch_created` / `network_validated` / `network_snapshot_created` / `dispute_opened` / `dispute_resolved` / `clearing_closed`）；
 - `after`：只返回 `seq > after` 的记录（分页游标，默认 0）；
 - `limit`：每页条数（默认 100，最大 1000）。
 

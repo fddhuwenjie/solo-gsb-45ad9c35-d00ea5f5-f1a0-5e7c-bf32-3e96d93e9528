@@ -343,6 +343,67 @@ BEGIN
     SELECT RAISE(ABORT, 'disruption_replans is append-only: DELETE is not allowed');
 END;
 
+-- Operator fare clearing. A clearing_id maps to at most one request; the
+-- canonical payload hash enforces idempotency (same payload replays the
+-- stored batch, different payload -> 409). The first close (kind='initial')
+-- freezes the half-open window and the allocation rules; every later batch
+-- (kind='adjustment') attaches to it via initial_clearing_id and inherits
+-- them. Ledger rows are append-only: the first close posts the full
+-- allocation, later batches post only signed differences. Closed rows can
+-- never be rewritten; corrections are always a new clearing_id.
+CREATE TABLE IF NOT EXISTS clearing_batches (
+    clearing_id           TEXT PRIMARY KEY,
+    initial_clearing_id   TEXT NOT NULL,      -- first close of the chain
+    chain_seq             INTEGER NOT NULL,   -- 1 for the first close, 2,3,...
+    kind                  TEXT NOT NULL CHECK (kind IN ('initial', 'adjustment')),
+    payload_hash          TEXT NOT NULL,      -- sha256 of the canonical request
+    window_start          TEXT NOT NULL,      -- ISO-8601, normalised to UTC
+    window_end            TEXT NOT NULL,      -- half-open window on tap-out time
+    rules                 TEXT NOT NULL,      -- canonical JSON, frozen at first close
+    trip_count            INTEGER NOT NULL,   -- in-window trips seen at this close
+    total_cents           INTEGER NOT NULL,   -- current amounts split by this batch
+    created_at            TEXT NOT NULL,
+    FOREIGN KEY (initial_clearing_id) REFERENCES clearing_batches(clearing_id)
+);
+
+CREATE TABLE IF NOT EXISTS clearing_entries (
+    clearing_id               TEXT NOT NULL REFERENCES clearing_batches(clearing_id),
+    seq                       INTEGER NOT NULL,  -- 0-based, in batch order
+    trip_id                   TEXT NOT NULL,
+    from_station              TEXT NOT NULL,
+    to_station                TEXT NOT NULL,
+    operator_id               TEXT NOT NULL,
+    delta_cents               INTEGER NOT NULL,  -- signed immutable posting
+    current_amount_cents      INTEGER NOT NULL,  -- live trip charge at this close
+    cumulative_amount_cents   INTEGER NOT NULL,  -- net per operator after this batch
+    created_at                TEXT NOT NULL,
+    PRIMARY KEY (clearing_id, seq)
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_clearing_batches_no_update
+BEFORE UPDATE ON clearing_batches
+BEGIN
+    SELECT RAISE(ABORT, 'clearing_batches is append-only: UPDATE is not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_clearing_batches_no_delete
+BEFORE DELETE ON clearing_batches
+BEGIN
+    SELECT RAISE(ABORT, 'clearing_batches is append-only: DELETE is not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_clearing_entries_no_update
+BEFORE UPDATE ON clearing_entries
+BEGIN
+    SELECT RAISE(ABORT, 'clearing_entries is an immutable ledger: UPDATE is not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_clearing_entries_no_delete
+BEFORE DELETE ON clearing_entries
+BEGIN
+    SELECT RAISE(ABORT, 'clearing_entries is an immutable ledger: DELETE is not allowed');
+END;
+
 -- Append-only, hash-chained business audit log. One global sequence spans all
 -- operation types; record_n hashes seq | operation | timestamp | canonical
 -- request/result summaries | record_{n-1}'s hash. Rows are only ever inserted
@@ -353,7 +414,8 @@ CREATE TABLE IF NOT EXISTS audit_log (
                          ('event_processed', 'event_corrected',
                           'recon_batch_created', 'network_validated',
                           'network_snapshot_created',
-                          'dispute_opened', 'dispute_resolved')),
+                          'dispute_opened', 'dispute_resolved',
+                          'clearing_closed')),
     occurred_at      TEXT NOT NULL,         -- ISO-8601, normalised to UTC
     request_summary  TEXT NOT NULL,         -- canonical JSON of the normalised request
     result_summary   TEXT NOT NULL,         -- canonical JSON of the normalised result
@@ -375,13 +437,13 @@ END;
 """
 
 # Rebuild statement used when upgrading a database created before a newer
-# operation type (network validation, then fare disputes): SQLite cannot ALTER
-# a CHECK constraint, so the audit table is rebuilt with the rows preserved
-# (its hash chain lives entirely in columns).
+# operation type (network validation, fare disputes, operator clearing):
+# SQLite cannot ALTER a CHECK constraint, so the audit table is rebuilt with
+# the rows preserved (its hash chain lives entirely in columns).
 _AUDIT_OPERATIONS = (
     "event_processed", "event_corrected", "recon_batch_created",
     "network_validated", "network_snapshot_created",
-    "dispute_opened", "dispute_resolved",
+    "dispute_opened", "dispute_resolved", "clearing_closed",
 )
 
 _AUDIT_UPGRADE = """
@@ -394,7 +456,8 @@ CREATE TABLE audit_log (
                          ('event_processed', 'event_corrected',
                           'recon_batch_created', 'network_validated',
                           'network_snapshot_created',
-                          'dispute_opened', 'dispute_resolved')),
+                          'dispute_opened', 'dispute_resolved',
+                          'clearing_closed')),
     occurred_at      TEXT NOT NULL,
     request_summary  TEXT NOT NULL,
     result_summary   TEXT NOT NULL,

@@ -14,6 +14,15 @@ from starlette.background import BackgroundTask
 from starlette.responses import FileResponse
 
 from .audit import append_audit, canonical_json, verify_chain
+from .clearing import (
+    build_adjustment_entries,
+    build_initial_entries,
+    canonical_adjustment_payload,
+    canonical_initial_payload,
+    find_missing_rule_pairs,
+    normalise_rules,
+    payload_hash as clearing_payload_hash,
+)
 from .config import FareConfig, load_config
 from .db import Database
 from .disputes import (
@@ -41,6 +50,9 @@ from .models import (
     AuditList,
     AuditVerification,
     Bill,
+    ClearingBatchOut,
+    ClearingEntryOut,
+    ClearingIn,
     DisputeIn,
     DisputeOut,
     DisputeResolveIn,
@@ -114,7 +126,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Transit Fare Settlement API",
-    version="1.8.0",
+    version="1.9.0",
     lifespan=lifespan,
 )
 
@@ -992,6 +1004,309 @@ def get_dispute(
 
 
 # ---------------------------------------------------------------------------
+# Operator fare clearing (immutable first close + signed-difference batches)
+# ---------------------------------------------------------------------------
+
+
+def _load_window_trips(conn, window_start, window_end) -> list[dict]:
+    """Trip charges whose tap-out time falls inside the half-open window.
+    Filtered in Python because stored ISO strings may carry optional
+    fractional seconds, which breaks lexicographic comparison at the boundary."""
+    rows = conn.execute(
+        "SELECT t.trip_id, t.from_station, t.to_station, t.ended_at,"
+        " c.amount_cents"
+        " FROM trips t JOIN trip_charges c ON c.trip_id = t.trip_id"
+    ).fetchall()
+    trips = []
+    for r in rows:
+        ended = normalize_ts(
+            datetime.fromisoformat(r["ended_at"].replace("Z", "+00:00"))
+        )
+        if window_start <= ended < window_end:
+            trips.append(
+                {
+                    "trip_id": r["trip_id"],
+                    "from_station": r["from_station"],
+                    "to_station": r["to_station"],
+                    "ended_at": ended,
+                    "amount_cents": r["amount_cents"],
+                }
+            )
+    trips.sort(key=lambda t: (t["ended_at"], t["trip_id"]))
+    return trips
+
+
+def _load_clearing(db: Database, clearing_id: str) -> tuple:
+    b = db.conn.execute(
+        "SELECT * FROM clearing_batches WHERE clearing_id = ?", (clearing_id,)
+    ).fetchone()
+    if b is None:
+        raise HTTPException(
+            status_code=404, detail=f"clearing '{clearing_id}' not found"
+        )
+    rows = db.conn.execute(
+        "SELECT clearing_id, seq, trip_id, from_station, to_station, operator_id,"
+        " delta_cents, current_amount_cents, cumulative_amount_cents, created_at"
+        " FROM clearing_entries WHERE clearing_id = ? ORDER BY seq",
+        (clearing_id,),
+    ).fetchall()
+    return b, [dict(r) for r in rows]
+
+
+def _clearing_response(b, entries: list[dict], status: str, currency: str) -> ClearingBatchOut:
+    # Entries may come from the builders (no clearing_id) or from a SELECT
+    # (clearing_id included); normalise to the response shape either way.
+    out_entries = [
+        ClearingEntryOut(
+            clearing_id=b["clearing_id"],
+            **{k: v for k, v in e.items() if k != "clearing_id"},
+        )
+        for e in entries
+    ]
+    return ClearingBatchOut(
+        clearing_id=b["clearing_id"],
+        status=status,
+        kind=b["kind"],
+        initial_clearing_id=b["initial_clearing_id"],
+        chain_seq=b["chain_seq"],
+        window_start=b["window_start"],
+        window_end=b["window_end"],
+        currency=currency,
+        rules=json.loads(b["rules"]),
+        trip_count=b["trip_count"],
+        total_cents=b["total_cents"],
+        entry_count=len(entries),
+        entries=out_entries,
+    )
+
+
+@app.post("/clearings", response_model=ClearingBatchOut, status_code=200)
+def create_clearing(
+    body: ClearingIn,
+    cfg: FareConfig = Depends(get_config),
+    db: Database = Depends(get_db),
+) -> ClearingBatchOut:
+    is_adjustment = body.initial_clearing_id is not None
+
+    # Structural validation, before any persistence: an adjustment batch is
+    # just (new clearing_id, initial_clearing_id); the window and rules are
+    # inherited from the frozen first close and must not be re-submitted.
+    if is_adjustment:
+        if body.window_start is not None or body.window_end is not None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "adjustment batches inherit the window frozen by"
+                    " initial_clearing_id; do not send window_start/window_end"
+                ),
+            )
+        if body.rules is not None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "adjustment batches inherit the rules frozen by"
+                    " initial_clearing_id; do not send rules"
+                ),
+            )
+    else:
+        if body.window_start is None or body.window_end is None:
+            raise HTTPException(
+                status_code=422,
+                detail="window_start and window_end are required for the first close",
+            )
+        if not body.rules:
+            raise HTTPException(
+                status_code=422, detail="rules are required for the first close"
+            )
+        try:
+            rules = normalise_rules(body.rules)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        window_start = normalize_ts(body.window_start)
+        window_end = normalize_ts(body.window_end)
+        if window_end <= window_start:
+            raise HTTPException(
+                status_code=422, detail="window_end must be after window_start"
+            )
+        canonical_payload = canonical_initial_payload(
+            body.clearing_id, window_start, window_end, rules
+        )
+
+    p_hash = clearing_payload_hash(
+        canonical_adjustment_payload(body.clearing_id, body.initial_clearing_id)
+        if is_adjustment
+        else canonical_payload
+    )
+
+    with db.lock(), db.conn:
+        existing = db.conn.execute(
+            "SELECT * FROM clearing_batches WHERE clearing_id = ?",
+            (body.clearing_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing["payload_hash"] != p_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"clearing_id '{body.clearing_id}' already exists with a"
+                        " different payload"
+                    ),
+                )
+            # Idempotent replay: the frozen batch and its immutable ledger are
+            # never recomputed or rewritten.
+            b, entries = _load_clearing(db, body.clearing_id)
+            return _clearing_response(b, entries, "duplicate", cfg.currency)
+
+        if is_adjustment:
+            root = db.conn.execute(
+                "SELECT * FROM clearing_batches WHERE clearing_id = ?",
+                (body.initial_clearing_id,),
+            ).fetchone()
+            if root is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"initial_clearing_id '{body.initial_clearing_id}' not"
+                        " found; create the first close before submitting an"
+                        " adjustment batch"
+                    ),
+                )
+            if root["kind"] != "initial":
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"initial_clearing_id '{body.initial_clearing_id}' is an"
+                        " adjustment batch; reference the first close"
+                        f" '{root['initial_clearing_id']}' instead"
+                    ),
+                )
+            window_start = datetime.fromisoformat(
+                root["window_start"].replace("Z", "+00:00")
+            )
+            window_end = datetime.fromisoformat(
+                root["window_end"].replace("Z", "+00:00")
+            )
+            rules = json.loads(root["rules"])
+
+        trips = _load_window_trips(db.conn, window_start, window_end)
+
+        # Whole-batch rejection: every in-window trip must have a matching
+        # station-pair rule. Missing rules are reported, nothing is stored.
+        missing = find_missing_rule_pairs(trips, rules)
+        if missing:
+            pairs = ", ".join(f"{a} -> {b}" for a, b in missing)
+            raise HTTPException(
+                status_code=422,
+                detail=f"no allocation rule for station pair(s): {pairs}",
+            )
+
+        created_at = iso_str(datetime.now(timezone.utc))
+        if is_adjustment:
+            # Every ledger row posted by any earlier batch of this chain
+            # (initial close included). Rows are immutable; the cumulative net
+            # per (trip, operator) is the sum of the signed postings.
+            previous = [
+                dict(r)
+                for r in db.conn.execute(
+                    "SELECT ce.* FROM clearing_entries ce"
+                    " JOIN clearing_batches cb ON cb.clearing_id = ce.clearing_id"
+                    " WHERE cb.initial_clearing_id = ?"
+                    " ORDER BY cb.chain_seq, ce.seq",
+                    (body.initial_clearing_id,),
+                ).fetchall()
+            ]
+            entries = build_adjustment_entries(trips, rules, previous, created_at)
+            initial_id = body.initial_clearing_id
+            chain_seq = db.conn.execute(
+                "SELECT COALESCE(MAX(chain_seq), 0) + 1 FROM clearing_batches"
+                " WHERE initial_clearing_id = ?",
+                (initial_id,),
+            ).fetchone()[0]
+            kind = "adjustment"
+        else:
+            entries = build_initial_entries(trips, rules, created_at)
+            initial_id = body.clearing_id
+            chain_seq = 1
+            kind = "initial"
+
+        total_cents = sum(t["amount_cents"] for t in trips)
+        db.conn.execute(
+            "INSERT INTO clearing_batches (clearing_id, initial_clearing_id,"
+            " chain_seq, kind, payload_hash, window_start, window_end, rules,"
+            " trip_count, total_cents, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                body.clearing_id,
+                initial_id,
+                chain_seq,
+                kind,
+                p_hash,
+                iso_str(window_start),
+                iso_str(window_end),
+                canonical_json(rules),
+                len(trips),
+                total_cents,
+                created_at,
+            ),
+        )
+        db.conn.executemany(
+            "INSERT INTO clearing_entries (clearing_id, seq, trip_id,"
+            " from_station, to_station, operator_id, delta_cents,"
+            " current_amount_cents, cumulative_amount_cents, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            [
+                (
+                    body.clearing_id,
+                    e["seq"],
+                    e["trip_id"],
+                    e["from_station"],
+                    e["to_station"],
+                    e["operator_id"],
+                    e["delta_cents"],
+                    e["current_amount_cents"],
+                    e["cumulative_amount_cents"],
+                    created_at,
+                )
+                for e in entries
+            ],
+        )
+        # Audit inside the same transaction: a failed business write rolls the
+        # audit record back as well.
+        response = _clearing_response(
+            db.conn.execute(
+                "SELECT * FROM clearing_batches WHERE clearing_id = ?",
+                (body.clearing_id,),
+            ).fetchone(),
+            entries,
+            "created",
+            cfg.currency,
+        )
+        append_audit(
+            db.conn,
+            "clearing_closed",
+            (
+                canonical_adjustment_payload(body.clearing_id, initial_id)
+                if is_adjustment
+                else canonical_payload
+            ),
+            response.model_dump(),
+        )
+
+    return response
+
+
+@app.get("/clearings/{clearing_id}", response_model=ClearingBatchOut)
+def get_clearing(
+    clearing_id: str,
+    cfg: FareConfig = Depends(get_config),
+    db: Database = Depends(get_db),
+) -> ClearingBatchOut:
+    with db.lock():
+        b, entries = _load_clearing(db, clearing_id)
+    return _clearing_response(b, entries, "created", cfg.currency)
+
+
+# ---------------------------------------------------------------------------
 # Tap-event quality scans (read-only analysis, isolated append-only tables)
 # ---------------------------------------------------------------------------
 
@@ -1436,7 +1751,7 @@ def list_audit(
         default=None,
         pattern="^(event_processed|event_corrected|recon_batch_created"
                 "|network_validated|network_snapshot_created"
-                "|dispute_opened|dispute_resolved)$",
+                "|dispute_opened|dispute_resolved|clearing_closed)$",
         description="Filter by operation type",
     ),
     after: int = Query(default=0, ge=0, description="Return records with seq > after"),

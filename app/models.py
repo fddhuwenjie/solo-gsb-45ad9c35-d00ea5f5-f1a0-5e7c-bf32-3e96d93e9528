@@ -132,7 +132,7 @@ class ReconBatchOut(BaseModel):
 AuditOperation = Literal[
     "event_processed", "event_corrected", "recon_batch_created",
     "network_validated", "network_snapshot_created",
-    "dispute_opened", "dispute_resolved",
+    "dispute_opened", "dispute_resolved", "clearing_closed",
 ]
 
 
@@ -506,6 +506,80 @@ class ReplanSummary(BaseModel):
     group_count: int
     assigned_count: int
     stranded_count: int
+
+
+# ---------------------------------------------------------------------------
+# Operator fare clearing
+# ---------------------------------------------------------------------------
+
+
+class ClearingShareIn(BaseModel):
+    operator_id: str = Field(min_length=1, max_length=64)
+    basis_points: int = Field(
+        ge=0,
+        description="Share of the trip amount in basis points (1/10000)",
+    )
+
+
+class ClearingRuleIn(BaseModel):
+    from_station: str = Field(min_length=1, max_length=64)
+    to_station: str = Field(min_length=1, max_length=64)
+    shares: list[ClearingShareIn] = Field(
+        min_length=1,
+        description="Operator shares for this directed station pair; must total 10000",
+    )
+
+
+class ClearingIn(BaseModel):
+    clearing_id: str = Field(min_length=1, max_length=128)
+    # Half-open UTC window [window_start, window_end) on trip tap-out time
+    # (ended_at). Required for the first close (no initial_clearing_id); an
+    # adjustment batch inherits the window frozen by its initial close.
+    window_start: datetime | None = None
+    window_end: datetime | None = None
+    # Operator allocation rules keyed by directed station pair. Required for
+    # the first close; adjustment batches reuse the frozen rules verbatim.
+    rules: list[ClearingRuleIn] | None = Field(
+        default=None,
+        description="Station-pair allocation rules; every share list must total 10000",
+    )
+    # Set on follow-up batches: the new clearing_id appends differences on top
+    # of the immutable first close referenced here.
+    initial_clearing_id: str | None = Field(
+        default=None, min_length=1, max_length=128,
+        description="First close this adjustment batch is built upon",
+    )
+
+
+class ClearingEntryOut(BaseModel):
+    clearing_id: str
+    seq: int                        # 0-based, in batch order
+    trip_id: str
+    from_station: str
+    to_station: str
+    operator_id: str
+    # Signed amount this immutable row posts: the full allocation on the
+    # first close, the appended signed difference on later batches.
+    delta_cents: int
+    current_amount_cents: int       # live trip charge at this batch's close
+    cumulative_amount_cents: int    # net allocated to the operator after this batch
+    created_at: str
+
+
+class ClearingBatchOut(BaseModel):
+    clearing_id: str
+    status: Literal["created", "duplicate"]
+    kind: Literal["initial", "adjustment"]
+    initial_clearing_id: str        # the first close's id (equals clearing_id initially)
+    chain_seq: int                  # 1 for the first close, 2,3,... for adjustments
+    window_start: str
+    window_end: str
+    currency: str
+    rules: list[ClearingRuleIn]
+    trip_count: int                 # in-window trips seen at this batch's close
+    total_cents: int                # current amounts allocated by this batch
+    entry_count: int
+    entries: list[ClearingEntryOut]
 
 
 class DisruptionReplanOut(BaseModel):
