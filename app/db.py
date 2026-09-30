@@ -197,6 +197,77 @@ BEGIN
     SELECT RAISE(ABORT, 'refunds is an immutable ledger: DELETE is not allowed');
 END;
 
+-- Operator fare clearing. The first closing (seq 0) freezes the settlement
+-- window and the per-station-pair operator rules; follow-up batches (seq >= 1)
+-- reference it via root_clearing_id and inherit both frozen values. Both
+-- tables are append-only: corrections to tap events never rewrite a closed
+-- batch -- adjustment batches only append signed deltas to the entries table.
+CREATE TABLE IF NOT EXISTS clearing_batches (
+    clearing_id           TEXT PRIMARY KEY,
+    root_clearing_id      TEXT NOT NULL REFERENCES clearing_batches(clearing_id),
+    seq                   INTEGER NOT NULL,            -- 0 = first closing, 1+ = adjustments
+    kind                  TEXT NOT NULL CHECK (kind IN ('initial', 'adjustment')),
+    payload_hash          TEXT NOT NULL,              -- sha256 of the canonical request
+    window_start          TEXT NOT NULL,              -- frozen on the first closing
+    window_end            TEXT NOT NULL,              -- half-open window on tap-out time
+    rules                 TEXT NOT NULL,               -- canonical JSON, frozen on the first closing
+    base_clearing_id      TEXT,                       -- referenced first closing (adjustments)
+    trip_count            INTEGER NOT NULL,            -- current in-window trips seen
+    reversed_trip_count   INTEGER NOT NULL,            -- trips reversed to zero
+    ledger_row_count      INTEGER NOT NULL,
+    gross_amount_cents    INTEGER NOT NULL,            -- sum of current trip grosses
+    net_amount_cents      INTEGER NOT NULL,            -- signed amount booked by this batch
+    created_at            TEXT NOT NULL,
+    UNIQUE (root_clearing_id, seq)
+);
+
+-- Immutable per-trip / per-operator ledger. A first closing inserts the full
+-- split of each in-window trip (basis_points populated). Adjustment batches
+-- append only signed difference rows (basis_points NULL): the current target
+-- split minus the cumulative amount booked by earlier batches of the chain.
+CREATE TABLE IF NOT EXISTS clearing_entries (
+    clearing_id              TEXT NOT NULL REFERENCES clearing_batches(clearing_id),
+    seq                      INTEGER NOT NULL,
+    trip_id                  TEXT NOT NULL,
+    passenger_id             TEXT NOT NULL,
+    from_station             TEXT NOT NULL,
+    to_station               TEXT NOT NULL,
+    ended_at                 TEXT NOT NULL,
+    operator_id              TEXT NOT NULL,
+    basis_points             INTEGER,          -- share rule, NULL on adjustment rows
+    gross_amount_cents       INTEGER NOT NULL, -- current trip gross at this batch (0 when reversed)
+    amount_cents             INTEGER NOT NULL, -- initial split or signed adjustment delta
+    prior_amount_cents       INTEGER NOT NULL,
+    cumulative_amount_cents  INTEGER NOT NULL,
+    PRIMARY KEY (clearing_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_clearing_entries_chain
+    ON clearing_entries (trip_id, operator_id);
+
+CREATE TRIGGER IF NOT EXISTS trg_clearing_batches_no_update
+BEFORE UPDATE ON clearing_batches
+BEGIN
+    SELECT RAISE(ABORT, 'clearing_batches is append-only: UPDATE is not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_clearing_batches_no_delete
+BEFORE DELETE ON clearing_batches
+BEGIN
+    SELECT RAISE(ABORT, 'clearing_batches is append-only: DELETE is not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_clearing_entries_no_update
+BEFORE UPDATE ON clearing_entries
+BEGIN
+    SELECT RAISE(ABORT, 'clearing_entries is an immutable ledger: UPDATE is not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_clearing_entries_no_delete
+BEFORE DELETE ON clearing_entries
+BEGIN
+    SELECT RAISE(ABORT, 'clearing_entries is an immutable ledger: DELETE is not allowed');
+END;
+
 -- Tap-event quality scans. These tables are deliberately isolated from the
 -- settlement domain: a scan only ever reads events and appends its own rows.
 -- Events, trips, trip_charges, disputes and the audit_log are never touched by
@@ -353,7 +424,8 @@ CREATE TABLE IF NOT EXISTS audit_log (
                          ('event_processed', 'event_corrected',
                           'recon_batch_created', 'network_validated',
                           'network_snapshot_created',
-                          'dispute_opened', 'dispute_resolved')),
+                          'dispute_opened', 'dispute_resolved',
+                          'clearing_closed')),
     occurred_at      TEXT NOT NULL,         -- ISO-8601, normalised to UTC
     request_summary  TEXT NOT NULL,         -- canonical JSON of the normalised request
     result_summary   TEXT NOT NULL,         -- canonical JSON of the normalised result
@@ -381,7 +453,7 @@ END;
 _AUDIT_OPERATIONS = (
     "event_processed", "event_corrected", "recon_batch_created",
     "network_validated", "network_snapshot_created",
-    "dispute_opened", "dispute_resolved",
+    "dispute_opened", "dispute_resolved", "clearing_closed",
 )
 
 _AUDIT_UPGRADE = """
@@ -394,7 +466,8 @@ CREATE TABLE audit_log (
                          ('event_processed', 'event_corrected',
                           'recon_batch_created', 'network_validated',
                           'network_snapshot_created',
-                          'dispute_opened', 'dispute_resolved')),
+                          'dispute_opened', 'dispute_resolved',
+                          'clearing_closed')),
     occurred_at      TEXT NOT NULL,
     request_summary  TEXT NOT NULL,
     result_summary   TEXT NOT NULL,

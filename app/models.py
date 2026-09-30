@@ -132,7 +132,7 @@ class ReconBatchOut(BaseModel):
 AuditOperation = Literal[
     "event_processed", "event_corrected", "recon_batch_created",
     "network_validated", "network_snapshot_created",
-    "dispute_opened", "dispute_resolved",
+    "dispute_opened", "dispute_resolved", "clearing_closed",
 ]
 
 
@@ -308,6 +308,92 @@ class DisputeOut(BaseModel):
     snapshot: ChargeSnapshot
     refund: RefundRecord | None
     recomputed: RecomputedSettlement
+
+
+# ---------------------------------------------------------------------------
+# Operator fare clearing (运营方票款清分)
+# ---------------------------------------------------------------------------
+
+
+class ClearingShareIn(BaseModel):
+    operator_id: str = Field(min_length=1, max_length=128)
+    basis_points: int = Field(
+        ge=0,
+        le=10000,
+        description="Share in basis points (万分比); the pair's shares must sum to 10000",
+    )
+
+
+class ClearingRuleIn(BaseModel):
+    from_station: str = Field(min_length=1, max_length=64)
+    to_station: str = Field(min_length=1, max_length=64)
+    shares: list[ClearingShareIn] = Field(
+        min_length=1,
+        description="Per-operator basis-point shares; must sum to exactly 10000",
+    )
+
+
+class ClearingIn(BaseModel):
+    clearing_id: str = Field(min_length=1, max_length=128)
+    window_start: datetime  # half-open UTC window [window_start, window_end)
+    window_end: datetime    # on the trips' tap-out time (ended_at)
+    rules: list[ClearingRuleIn] = Field(min_length=1)
+
+
+class ClearingAdjustmentIn(BaseModel):
+    clearing_id: str = Field(min_length=1, max_length=128)
+    base_clearing_id: str = Field(
+        min_length=1,
+        max_length=128,
+        description="The first closing (seq 0) whose frozen window and rules apply",
+    )
+
+
+class ClearingRuleOut(BaseModel):
+    from_station: str
+    to_station: str
+    shares: list[ClearingShareIn]
+
+
+class ClearingEntryOut(BaseModel):
+    seq: int
+    trip_id: str
+    passenger_id: str
+    from_station: str
+    to_station: str
+    ended_at: str
+    operator_id: str
+    basis_points: int | None      # null on adjustment delta rows
+    gross_amount_cents: int       # current trip gross for this batch's view (0 once reversed)
+    amount_cents: int             # initial split, or signed delta on adjustment rows
+    prior_amount_cents: int       # cumulative per trip/operator booked before this batch
+    cumulative_amount_cents: int  # cumulative per trip/operator after this batch
+    kind: Literal["initial", "adjustment"]
+
+
+class ClearingOperatorTotal(BaseModel):
+    operator_id: str
+    amount_cents: int             # cumulative booked position across the whole chain
+
+
+class ClearingBatchOut(BaseModel):
+    clearing_id: str
+    root_clearing_id: str
+    status: Literal["created", "duplicate"]
+    kind: Literal["initial", "adjustment"]
+    seq: int                        # 0 for the first closing, 1+ for follow-up batches
+    window_start: str
+    window_end: str
+    rules: list[ClearingRuleOut]
+    base_clearing_id: str | None    # the referenced first closing on adjustment batches
+    trip_count: int                 # current trips seen by this batch inside the window
+    reversed_trip_count: int        # trips reversed to zero (vanished / left the window)
+    ledger_row_count: int
+    gross_amount_cents: int         # sum of current trips' gross (0-amount deltas omitted)
+    net_amount_cents: int           # signed amount this batch books (initial gross; delta sum later)
+    entries: list[ClearingEntryOut]
+    operator_totals: list[ClearingOperatorTotal]  # cumulative chain-wide positions
+    created_at: str
 
 
 # ---------------------------------------------------------------------------

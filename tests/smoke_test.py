@@ -8,6 +8,12 @@ idempotency/conflict, snapshot freeze/query/immutability),
 the fare dispute endpoints (frozen charge snapshot, claim cap, optimistic
 one-shot resolution, immutable refund ledger, version conflict/idempotency,
 top-up/clawback differences after later corrections),
+the operator fare clearing endpoints (first closing freezes the half-open
+window and per-station-pair basis-point rules, whole-batch rejection on
+missing/non-10000 rules, remainder/operator-id cent allocation, immutable
+per-trip ledger, adjustment batches referencing the root that append only
+signed target-minus-cumulative deltas, full reversal of vanished trips,
+idempotent replay/409 conflict, frozen-result query, append-only triggers),
 the tap-event quality scan endpoints (half-open event window, duplicate
 same-type taps, minimum-travel out->in conflicts, evidence chains,
 idempotency/409 conflict, GET query, isolated append-only tables with no
@@ -833,6 +839,317 @@ def run(client):
               [r[0] for r in raw.execute(
                   "SELECT amount_cents FROM refunds ORDER BY refund_id")]
               == [350, 200, 0, 300])
+
+    # --- Operator fare clearing -----------------------------------------------
+    # 2026-10-10: three trips on a dedicated passenger OP, amounts 500 / 400 / 400.
+    #   op1:op2  S01(zone1) -> S04(zone2), 08:00->08:30, 500
+    #   op3:op4  S05(zone2) -> S02(zone1), 09:00->09:30, transfer 400
+    #   op5:op6  S01 -> S04,                    10:00->10:30, transfer 400
+    # Boundary trip op7:op8 ends exactly at window_end (excluded); it lands on
+    # the 2026-10-10 daily cap tail, so its amount is irrelevant to clearing.
+    def oppost(eid, st, tap, ts):
+        rr = client.post("/events", json={
+            "event_id": eid, "passenger_id": "OP",
+            "station_id": st, "tap_type": tap, "occurred_at": ts,
+        })
+        assert rr.status_code == 200, rr.text
+
+    oppost("op1", "S01", "in", "2026-10-10T08:00:00Z")
+    oppost("op2", "S04", "out", "2026-10-10T08:30:00Z")
+    oppost("op3", "S05", "in", "2026-10-10T09:00:00Z")
+    oppost("op4", "S02", "out", "2026-10-10T09:30:00Z")
+    oppost("op5", "S01", "in", "2026-10-10T10:00:00Z")
+    oppost("op6", "S04", "out", "2026-10-10T10:30:00Z")
+    oppost("op7", "S01", "in", "2026-10-10T23:30:00Z")
+    oppost("op8", "S04", "out", "2026-10-11T00:00:00Z")
+    bill = {t["trip_id"]: t["amount_cents"]
+            for t in client.get("/passengers/OP/bill").json()["trips"]}
+    check("clearing fixtures priced 500/400/400 for the in-window trips",
+          bill["op1:op2"] == 500 and bill["op3:op4"] == 400
+          and bill["op5:op6"] == 400, bill)
+
+    clearing_rules = [
+        {"from_station": "S01", "to_station": "S04", "shares": [
+            {"operator_id": "OA", "basis_points": 3333},
+            {"operator_id": "OB", "basis_points": 3333},
+            {"operator_id": "OC", "basis_points": 3334}]},
+        {"from_station": "S05", "to_station": "S02", "shares": [
+            {"operator_id": "OA", "basis_points": 4000},
+            {"operator_id": "OD", "basis_points": 4000},
+            {"operator_id": "OE", "basis_points": 2000}]},
+    ]
+    clearing_body = {
+        "clearing_id": "clr-2026-10-10-a",
+        "window_start": "2026-10-10T00:00:00Z",
+        "window_end": "2026-10-11T00:00:00Z",
+        "rules": clearing_rules,
+    }
+
+    # Whole-batch rejections before any persistence.
+    r = client.post("/clearings", json=dict(
+        clearing_body, clearing_id="clr-bad-window",
+        window_start="2026-10-11T00:00:00Z", window_end="2026-10-10T00:00:00Z"))
+    check("clearing inverted window -> 422", r.status_code == 422)
+    r = client.post("/clearings", json=dict(
+        clearing_body, clearing_id="clr-bad-sum",
+        rules=[clearing_rules[0], {
+            "from_station": "S05", "to_station": "S02", "shares": [
+                {"operator_id": "OA", "basis_points": 4000},
+                {"operator_id": "OD", "basis_points": 4000},
+                {"operator_id": "OE", "basis_points": 1999}]}]))
+    check("clearing shares not summing to 10000 -> 422",
+          r.status_code == 422 and "9999" in r.text)
+    r = client.post("/clearings", json=dict(
+        clearing_body, clearing_id="clr-dup-op",
+        rules=[{"from_station": "S01", "to_station": "S04", "shares": [
+            {"operator_id": "OA", "basis_points": 5000},
+            {"operator_id": "OA", "basis_points": 5000}]}]))
+    check("clearing duplicate operator in a rule -> 422", r.status_code == 422)
+    r = client.post("/clearings", json=dict(
+        clearing_body, clearing_id="clr-dup-pair",
+        rules=clearing_rules + [clearing_rules[0]]))
+    check("clearing duplicate station pair -> 422", r.status_code == 422)
+    r = client.post("/clearings", json=dict(
+        clearing_body, clearing_id="clr-missing-rule",
+        rules=[clearing_rules[0]]))
+    check("clearing missing rule for an in-window pair -> 422 whole reject",
+          r.status_code == 422 and "S05->S02" in r.text)
+    check("rejected clearing leaves no row",
+          client.get("/clearings/clr-missing-rule").status_code == 404)
+
+    # First closing.
+    r = client.post("/clearings", json=clearing_body)
+    check("first clearing created", r.status_code == 200)
+    cb = r.json()
+    check("first clearing is initial seq 0",
+          cb["status"] == "created" and cb["kind"] == "initial" and cb["seq"] == 0
+          and cb["root_clearing_id"] == "clr-2026-10-10-a"
+          and cb["base_clearing_id"] is None)
+    check("half-open window excludes the boundary trip",
+          cb["trip_count"] == 3 and cb["reversed_trip_count"] == 0
+          and cb["gross_amount_cents"] == 1300)
+    cle = {(e["trip_id"], e["operator_id"]): e for e in cb["entries"]}
+    # 500 * 3333/10000 = 166.65 -> floor 166, leftover cent: OA/OB tie on .65
+    # remainder -> operator id asc gives it to OA.
+    check("500 split by remainder then operator id",
+          cle[("op1:op2", "OA")]["amount_cents"] == 167
+          and cle[("op1:op2", "OB")]["amount_cents"] == 166
+          and cle[("op1:op2", "OC")]["amount_cents"] == 167)
+    check("400 exact basis split",
+          cle[("op3:op4", "OA")]["amount_cents"] == 160
+          and cle[("op3:op4", "OD")]["amount_cents"] == 160
+          and cle[("op3:op4", "OE")]["amount_cents"] == 80)
+    # 400 * 3333 = 133.32 / OC 133.36 -> leftover cent to OC.
+    check("400 split by fractional remainder",
+          cle[("op5:op6", "OA")]["amount_cents"] == 133
+          and cle[("op5:op6", "OB")]["amount_cents"] == 133
+          and cle[("op5:op6", "OC")]["amount_cents"] == 134)
+    check("every split preserves the trip total", all(
+        sum(cle[(t, o)]["amount_cents"] for o in ops) == gross
+        for t, ops, gross in (
+            ("op1:op2", ("OA", "OB", "OC"), 500),
+            ("op3:op4", ("OA", "OD", "OE"), 400),
+            ("op5:op6", ("OA", "OB", "OC"), 400))))
+    check("initial rows carry basis_points and zero prior",
+          cle[("op1:op2", "OA")]["basis_points"] == 3333
+          and cle[("op1:op2", "OA")]["prior_amount_cents"] == 0
+          and cle[("op1:op2", "OA")]["cumulative_amount_cents"] == 167)
+    cop = {o["operator_id"]: o["amount_cents"] for o in cb["operator_totals"]}
+    check("initial chain operator totals",
+          cop == {"OA": 460, "OB": 299, "OC": 301, "OD": 160, "OE": 80}
+          and cb["net_amount_cents"] == 1300)
+
+    # Idempotency: same payload (even reordered) replays; different payload 409.
+    r = client.post("/clearings", json=clearing_body)
+    check("identical clearing replays as duplicate",
+          r.status_code == 200 and r.json()["status"] == "duplicate"
+          and r.json()["ledger_row_count"] == cb["ledger_row_count"])
+    shuffled_clearing = dict(clearing_body, rules=[
+        {"from_station": "S05", "to_station": "S02", "shares": [
+            {"operator_id": "OE", "basis_points": 2000},
+            {"operator_id": "OD", "basis_points": 4000},
+            {"operator_id": "OA", "basis_points": 4000}]},
+        {"from_station": "S01", "to_station": "S04", "shares": [
+            {"operator_id": "OC", "basis_points": 3334},
+            {"operator_id": "OB", "basis_points": 3333},
+            {"operator_id": "OA", "basis_points": 3333}]}])
+    r = client.post("/clearings", json=shuffled_clearing)
+    check("rule/share array order does not affect idempotency",
+          r.json()["status"] == "duplicate")
+    r = client.post("/clearings", json=dict(clearing_body, window_end="2026-10-12T00:00:00Z"))
+    check("same clearing_id different payload -> 409", r.status_code == 409)
+
+    # GET returns the frozen result.
+    g = client.get("/clearings/clr-2026-10-10-a").json()
+    check("GET clearing returns created marker and frozen window/rules",
+          g["status"] == "created" and g["window_start"] == "2026-10-10T00:00:00Z"
+          and g["window_end"] == "2026-10-11T00:00:00Z"
+          and len(g["rules"]) == 2
+          and g["operator_totals"] == cb["operator_totals"])
+    check("unknown clearing -> 404",
+          client.get("/clearings/nope").status_code == 404)
+
+    # Adjustment reference validation.
+    r = client.post("/clearings/adjustments", json={
+        "clearing_id": "clr-adj-x", "base_clearing_id": "no-such-root"})
+    check("adjustment with unknown root -> 404", r.status_code == 404)
+
+    # --- Correction: move op3 to 07:00 so op3:op4 disappears ------------------
+    r = client.post("/events", json={
+        "event_id": "op3", "passenger_id": "OP", "station_id": "S05",
+        "tap_type": "in", "occurred_at": "2026-10-10T07:00:00Z"})
+    check("op3 correction voids op3:op4",
+          any(a["trip_id"] == "op3:op4" and a["new_amount_cents"] == 0
+              for a in r.json()["adjustments"]))
+
+    r = client.post("/clearings/adjustments", json={
+        "clearing_id": "clr-2026-10-10-b", "base_clearing_id": "clr-2026-10-10-a"})
+    check("first adjustment created", r.status_code == 200, r.text)
+    ab = r.json()
+    check("adjustment inherits the frozen window and rules",
+          ab["kind"] == "adjustment" and ab["seq"] == 1
+          and ab["root_clearing_id"] == "clr-2026-10-10-a"
+          and ab["base_clearing_id"] == "clr-2026-10-10-a"
+          and ab["window_start"] == cb["window_start"]
+          and len(ab["rules"]) == 2)
+    check("adjustment sees 2 current trips and 1 reversal",
+          ab["trip_count"] == 2 and ab["reversed_trip_count"] == 1)
+    ae = {(e["trip_id"], e["operator_id"]): e for e in ab["entries"]}
+    check("unchanged trips append no delta rows",
+          ("op1:op2", "OA") not in ae and ("op5:op6", "OA") not in ae)
+    check("vanished trip is fully reversed with negative deltas",
+          ae[("op3:op4", "OA")]["amount_cents"] == -160
+          and ae[("op3:op4", "OD")]["amount_cents"] == -160
+          and ae[("op3:op4", "OE")]["amount_cents"] == -80
+          and ae[("op3:op4", "OE")]["gross_amount_cents"] == 0
+          and ae[("op3:op4", "OE")]["cumulative_amount_cents"] == 0
+          and ae[("op3:op4", "OE")]["basis_points"] is None)
+    aop = {o["operator_id"]: o["amount_cents"] for o in ab["operator_totals"]}
+    check("chain totals after reversal",
+          aop == {"OA": 300, "OB": 299, "OC": 301, "OD": 0, "OE": 0}
+          and sum(aop.values()) == 900 and ab["net_amount_cents"] == -400)
+
+    # Repeated adjustments never double-book.
+    r = client.post("/clearings/adjustments", json={
+        "clearing_id": "clr-2026-10-10-b", "base_clearing_id": "clr-2026-10-10-a"})
+    check("identical adjustment replays as duplicate, books nothing new",
+          r.json()["status"] == "duplicate"
+          and r.json()["ledger_row_count"] == ab["ledger_row_count"])
+    r = client.post("/clearings/adjustments", json={
+        "clearing_id": "clr-2026-10-10-b2", "base_clearing_id": "clr-2026-10-10-a"})
+    check("fresh adjustment against unchanged state appends zero deltas",
+          r.json()["seq"] == 2 and r.json()["entries"] == []
+          and r.json()["net_amount_cents"] == 0
+          and r.json()["operator_totals"] == ab["operator_totals"])
+    r = client.post("/clearings/adjustments", json={
+        "clearing_id": "clr-2026-10-10-b", "base_clearing_id": "other-root"})
+    check("same adjustment id different payload -> 409", r.status_code == 409)
+    r = client.post("/clearings/adjustments", json={
+        "clearing_id": "clr-adj-of-adj", "base_clearing_id": "clr-2026-10-10-b"})
+    check("adjustment referencing an adjustment batch -> 422", r.status_code == 422)
+
+    # Re-correction restores op3:op4: positive deltas bring it back.
+    client.post("/events", json={
+        "event_id": "op3", "passenger_id": "OP", "station_id": "S05",
+        "tap_type": "in", "occurred_at": "2026-10-10T09:00:00Z"})
+    r = client.post("/clearings/adjustments", json={
+        "clearing_id": "clr-2026-10-10-c", "base_clearing_id": "clr-2026-10-10-a"})
+    cc = r.json()
+    ce = {(e["trip_id"], e["operator_id"]): e for e in cc["entries"]}
+    check("restored trip appends positive make-up deltas",
+          ce[("op3:op4", "OA")]["amount_cents"] == 160
+          and ce[("op3:op4", "OD")]["amount_cents"] == 160
+          and ce[("op3:op4", "OE")]["amount_cents"] == 80
+          and ce[("op3:op4", "OA")]["prior_amount_cents"] == 0
+          and ce[("op3:op4", "OA")]["cumulative_amount_cents"] == 160
+          and ("op1:op2", "OA") not in ce)
+    check("restored adjustment returns chain totals to the first closing",
+          {o["operator_id"]: o["amount_cents"] for o in cc["operator_totals"]}
+          == cop)
+
+    # A station-pair correction to a pair the frozen rules do not cover is a
+    # whole-batch rejection that books nothing.
+    client.post("/events", json={
+        "event_id": "op6", "passenger_id": "OP", "station_id": "S07",
+        "tap_type": "out", "occurred_at": "2026-10-10T10:30:00Z"})
+    r = client.post("/clearings/adjustments", json={
+        "clearing_id": "clr-2026-10-10-d", "base_clearing_id": "clr-2026-10-10-a"})
+    check("new station pair outside frozen rules -> 422 whole reject",
+          r.status_code == 422 and "S01->S07" in r.text)
+    check("rejected adjustment leaves no row and no ledger movement",
+          client.get("/clearings/clr-2026-10-10-d").status_code == 404
+          and {o["operator_id"]: o["amount_cents"]
+               for o in client.get("/clearings/clr-2026-10-10-c").json()["operator_totals"]}
+          == cop)
+
+    # A station-pair correction BETWEEN two covered pairs re-settles the trip:
+    # op5:op6 moves S01->S04 onto S05->S02 (still a transfer trip, gross 400),
+    # so OA/OB/OC are reversed to zero and OA/OD/OE take up the new split.
+    client.post("/events", json={
+        "event_id": "op5", "passenger_id": "OP", "station_id": "S05",
+        "tap_type": "in", "occurred_at": "2026-10-10T10:00:00Z"})
+    client.post("/events", json={
+        "event_id": "op6", "passenger_id": "OP", "station_id": "S02",
+        "tap_type": "out", "occurred_at": "2026-10-10T10:30:00Z"})
+    bill = {t["trip_id"]: t["from_station"] + "->" + t["to_station"]
+            for t in client.get("/passengers/OP/bill").json()["trips"]}
+    check("op5:op6 re-paired onto the other covered rule pair",
+          bill.get("op5:op6") == "S05->S02", bill)
+    r = client.post("/clearings/adjustments", json={
+        "clearing_id": "clr-2026-10-10-e", "base_clearing_id": "clr-2026-10-10-a"})
+    check("covered pair change settles instead of rejecting", r.status_code == 200, r.text)
+    eb = r.json()
+    ee = {(e["trip_id"], e["operator_id"]): e for e in eb["entries"]}
+    check("pair change reverses the old-rule operators to zero",
+          ee[("op5:op6", "OB")]["amount_cents"] == -133
+          and ee[("op5:op6", "OC")]["amount_cents"] == -134
+          and ee[("op5:op6", "OB")]["cumulative_amount_cents"] == 0
+          and ee[("op5:op6", "OC")]["cumulative_amount_cents"] == 0)
+    check("pair change tops up the new-rule operators",
+          ee[("op5:op6", "OA")]["amount_cents"] == 27   # 160 target - 133 prior
+          and ee[("op5:op6", "OD")]["amount_cents"] == 160
+          and ee[("op5:op6", "OE")]["amount_cents"] == 80
+          and ee[("op5:op6", "OA")]["cumulative_amount_cents"] == 160)
+    check("pair change delta nets to zero (same gross, different operators)",
+          eb["net_amount_cents"] == 0 and eb["reversed_trip_count"] == 0)
+    eop = {o["operator_id"]: o["amount_cents"] for o in eb["operator_totals"]}
+    check("chain totals after pair change",
+          eop == {"OA": 487, "OB": 166, "OC": 167, "OD": 320, "OE": 160}
+          and sum(eop.values()) == 1300, eop)
+
+    # First-closing ledger is immutable and chain-wide sums stay consistent.
+    with sqlite3.connect(os.environ["DB_PATH"]) as raw:
+        blocked_clearing = []
+        for stmt in (
+            "UPDATE clearing_batches SET net_amount_cents = 0"
+            " WHERE clearing_id = 'clr-2026-10-10-a'",
+            "DELETE FROM clearing_batches WHERE clearing_id = 'clr-2026-10-10-b'",
+            "UPDATE clearing_entries SET amount_cents = 1"
+            " WHERE clearing_id = 'clr-2026-10-10-a'",
+            "DELETE FROM clearing_entries WHERE clearing_id = 'clr-2026-10-10-a'",
+        ):
+            try:
+                raw.execute(stmt)
+            except sqlite3.Error:
+                blocked_clearing.append(stmt)
+        check("clearing batches/entries cannot be updated or deleted",
+              len(blocked_clearing) == 4)
+        check("first closing ledger rows never rewritten",
+              [row[0] for row in raw.execute(
+                  "SELECT amount_cents FROM clearing_entries"
+                  " WHERE clearing_id = 'clr-2026-10-10-a' ORDER BY seq")]
+              == [e["amount_cents"] for e in sorted(
+                  cb["entries"], key=lambda e: e["seq"])])
+        check("ledger per trip/operator cumulative equals current target or zero",
+              all(
+                  (row[2] or 0) >= 0
+                  for row in raw.execute(
+                      "SELECT trip_id, operator_id, SUM(amount_cents)"
+                      " FROM clearing_entries GROUP BY trip_id, operator_id")))
+        n_clearing_batches = raw.execute(
+            "SELECT COUNT(*) FROM clearing_batches").fetchone()[0]
+    check("five clearing batches persisted (initial + four adjustments)",
+          n_clearing_batches == 5)
 
     # --- Tap-event quality scans ----------------------------------------------
     def qpost(event_id, passenger, station, tap, ts):
@@ -1706,9 +2023,11 @@ def run(client):
         ).fetchone()[0]
         n_disputes = raw.execute("SELECT COUNT(*) FROM disputes").fetchone()[0]
         n_resolved = raw.execute("SELECT COUNT(*) FROM refunds").fetchone()[0]
+        n_clearing = raw.execute(
+            "SELECT COUNT(*) FROM clearing_batches").fetchone()[0]
     check("one processed audit per stored event", ops.get("event_processed") == n_events)
-    check("five corrected audits (a2, ra2, dp2, dp4, dp5)",
-          ops.get("event_corrected") == 5)
+    check("ten corrected audits (a2, ra2, dp2, dp4, dp5, op3 x2, op6, op5, op6 re-pair)",
+          ops.get("event_corrected") == 10)
     check("one created audit per recon batch", ops.get("recon_batch_created") == n_batches)
     check("one audit per network validation",
           ops.get("network_validated") == n_validations)
@@ -1718,6 +2037,8 @@ def run(client):
           ops.get("dispute_opened") == n_disputes)
     check("one audit per resolved dispute",
           ops.get("dispute_resolved") == n_resolved)
+    check("one audit per clearing batch (initial and adjustments)",
+          ops.get("clearing_closed") == n_clearing == 5)
 
     entries = audit["entries"]
     check("genesis record has empty prev_hash", entries[0]["prev_hash"] == "")
@@ -1752,6 +2073,17 @@ def run(client):
     resolve("d1", 1, 350, "approved partial refund")                         # duplicate resolution
     resolve("d1", 2, 350, "approved partial refund")                         # 409 re-resolve
     resolve("d5", 2, 500)                                                    # 409 version conflict
+    client.post("/clearings", json=clearing_body)                            # duplicate clearing
+    client.post("/clearings", json=dict(clearing_body, window_end="2026-10-12T00:00:00Z"))  # 409
+    client.post("/clearings/adjustments", json={                             # duplicate adjustment
+        "clearing_id": "clr-2026-10-10-b", "base_clearing_id": "clr-2026-10-10-a"})
+    client.post("/clearings/adjustments", json={                             # 409 conflict
+        "clearing_id": "clr-2026-10-10-b", "base_clearing_id": "other-root"})
+    client.post("/clearings/adjustments", json={                             # 404 unknown root
+        "clearing_id": "clr-no-audit", "base_clearing_id": "no-such-root"})
+    client.post("/clearings", json=dict(                                     # 422 inverted window
+        clearing_body, clearing_id="clr-no-audit",
+        window_start="2026-10-11T00:00:00Z", window_end="2026-10-10T00:00:00Z"))
     client.post("/events", json={"event_id": "x9", "passenger_id": "X",
                                  "station_id": "NOPE", "tap_type": "in",
                                  "occurred_at": "2026-09-21T08:00:00Z"})  # 422
@@ -1818,8 +2150,9 @@ def run(client):
     append_audit(tmp, "network_snapshot_created", {"i": 5}, {"ok": True})
     append_audit(tmp, "dispute_opened", {"i": 6}, {"ok": True})
     append_audit(tmp, "dispute_resolved", {"i": 7}, {"ok": True})
+    append_audit(tmp, "clearing_closed", {"i": 8}, {"ok": True})
     rep = verify_chain(tmp)
-    check("fresh standalone chain verifies", rep["valid"] and rep["head_seq"] == 7)
+    check("fresh standalone chain verifies", rep["valid"] and rep["head_seq"] == 8)
     tmp.execute(
         "INSERT INTO network_validations (validation_id, payload_hash, payload,"
         " effective_start, effective_end, passed, result, created_at)"

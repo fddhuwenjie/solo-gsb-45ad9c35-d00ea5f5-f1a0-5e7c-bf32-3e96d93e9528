@@ -14,6 +14,18 @@ from starlette.background import BackgroundTask
 from starlette.responses import FileResponse
 
 from .audit import append_audit, canonical_json, verify_chain
+from .clearing import (
+    canonical_adjustment_payload,
+    canonical_initial_payload,
+    canonical_rules,
+    last_seen_trips,
+    load_clearing_trips,
+    payload_hash as clearing_payload_hash,
+    prior_operator_totals,
+    rule_map_from_canonical,
+    split_amount,
+    validate_rules as validate_clearing_rules,
+)
 from .config import FareConfig, load_config
 from .db import Database
 from .disputes import (
@@ -41,6 +53,11 @@ from .models import (
     AuditList,
     AuditVerification,
     Bill,
+    ClearingAdjustmentIn,
+    ClearingBatchOut,
+    ClearingEntryOut,
+    ClearingIn,
+    ClearingOperatorTotal,
     DisputeIn,
     DisputeOut,
     DisputeResolveIn,
@@ -114,7 +131,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Transit Fare Settlement API",
-    version="1.8.0",
+    version="1.9.0",
     lifespan=lifespan,
 )
 
@@ -992,6 +1009,403 @@ def get_dispute(
 
 
 # ---------------------------------------------------------------------------
+# Operator fare clearing (运营方票款清分)
+# ---------------------------------------------------------------------------
+
+
+def _clearing_operator_totals(db: Database, root_clearing_id: str) -> list[ClearingOperatorTotal]:
+    """Cumulative per-operator position booked across the whole chain (through
+    every batch, including the just-written one), sorted by operator id."""
+    rows = db.conn.execute(
+        "SELECT operator_id, SUM(amount_cents) AS amount"
+        " FROM clearing_entries e"
+        " JOIN clearing_batches b ON b.clearing_id = e.clearing_id"
+        " WHERE b.root_clearing_id = ?"
+        " GROUP BY operator_id ORDER BY operator_id",
+        (root_clearing_id,),
+    ).fetchall()
+    return [
+        ClearingOperatorTotal(operator_id=r["operator_id"], amount_cents=r["amount"])
+        for r in rows
+    ]
+
+
+def _load_clearing(db: Database, clearing_id: str, status: str) -> ClearingBatchOut:
+    batch = db.conn.execute(
+        "SELECT * FROM clearing_batches WHERE clearing_id = ?", (clearing_id,)
+    ).fetchone()
+    if batch is None:
+        raise HTTPException(
+            status_code=404, detail=f"clearing '{clearing_id}' not found"
+        )
+    rows = db.conn.execute(
+        "SELECT seq, trip_id, passenger_id, from_station, to_station, ended_at,"
+        " operator_id, basis_points, gross_amount_cents, amount_cents,"
+        " prior_amount_cents, cumulative_amount_cents"
+        " FROM clearing_entries WHERE clearing_id = ? ORDER BY seq",
+        (clearing_id,),
+    ).fetchall()
+    rules = json.loads(batch["rules"]) if batch["rules"] else []
+    return ClearingBatchOut(
+        clearing_id=batch["clearing_id"],
+        root_clearing_id=batch["root_clearing_id"],
+        status=status,
+        kind=batch["kind"],
+        seq=batch["seq"],
+        window_start=batch["window_start"],
+        window_end=batch["window_end"],
+        rules=rules,
+        base_clearing_id=batch["base_clearing_id"],
+        trip_count=batch["trip_count"],
+        reversed_trip_count=batch["reversed_trip_count"],
+        ledger_row_count=batch["ledger_row_count"],
+        gross_amount_cents=batch["gross_amount_cents"],
+        net_amount_cents=batch["net_amount_cents"],
+        entries=[
+            ClearingEntryOut(
+                seq=r["seq"],
+                trip_id=r["trip_id"],
+                passenger_id=r["passenger_id"],
+                from_station=r["from_station"],
+                to_station=r["to_station"],
+                ended_at=r["ended_at"],
+                operator_id=r["operator_id"],
+                basis_points=r["basis_points"],
+                gross_amount_cents=r["gross_amount_cents"],
+                amount_cents=r["amount_cents"],
+                prior_amount_cents=r["prior_amount_cents"],
+                cumulative_amount_cents=r["cumulative_amount_cents"],
+                kind=batch["kind"],
+            )
+            for r in rows
+        ],
+        operator_totals=_clearing_operator_totals(db, batch["root_clearing_id"]),
+        created_at=batch["created_at"],
+    )
+
+
+@app.post("/clearings", response_model=ClearingBatchOut, status_code=200)
+def create_clearing(
+    body: ClearingIn,
+    db: Database = Depends(get_db),
+) -> ClearingBatchOut:
+    """First closing: freeze the window and operator rules, read the current
+    in-window trip receivables, split every amount by basis points and write
+    the immutable ledger."""
+    window_start = normalize_ts(body.window_start)
+    window_end = normalize_ts(body.window_end)
+    if window_end <= window_start:
+        raise HTTPException(status_code=422, detail="window_end must be after window_start")
+    problem = validate_clearing_rules(body.rules)
+    if problem is not None:
+        raise HTTPException(status_code=422, detail=problem)
+
+    rules = canonical_rules(body.rules)
+    canonical_payload = canonical_initial_payload(
+        body.clearing_id, window_start, window_end, rules
+    )
+    p_hash = clearing_payload_hash(canonical_payload)
+
+    with db.lock(), db.conn:
+        existing = db.conn.execute(
+            "SELECT payload_hash FROM clearing_batches WHERE clearing_id = ?",
+            (body.clearing_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing["payload_hash"] != p_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"clearing_id '{body.clearing_id}' already exists with a"
+                        " different payload"
+                    ),
+                )
+            return _load_clearing(db, body.clearing_id, "duplicate")
+
+        rules_by_pair = rule_map_from_canonical(rules)
+        trips = load_clearing_trips(db.conn, window_start, window_end)
+        missing = sorted(
+            {f"{t['from_station']}->{t['to_station']}"
+             for t in trips if (t["from_station"], t["to_station"]) not in rules_by_pair}
+        )
+        if missing:
+            # Whole-batch rejection: no row is written when the frozen rules
+            # do not cover every in-window trip.
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "no matching operator rule for in-window trip station"
+                    f" pair(s): {missing}"
+                ),
+            )
+
+        created_at = iso_str(datetime.now(timezone.utc))
+        entries: list[dict] = []
+        gross_total = 0
+        for trip in trips:
+            shares = rules_by_pair[(trip["from_station"], trip["to_station"])]
+            allocations = split_amount(trip["amount_cents"], shares)
+            bp_by_operator = dict(shares)
+            gross_total += trip["amount_cents"]
+            for operator_id, basis_points in sorted(shares, key=lambda s: s[0]):
+                entries.append({
+                    "trip_id": trip["trip_id"],
+                    "passenger_id": trip["passenger_id"],
+                    "from_station": trip["from_station"],
+                    "to_station": trip["to_station"],
+                    "ended_at": trip["ended_at"],
+                    "operator_id": operator_id,
+                    "basis_points": basis_points,
+                    "gross_amount_cents": trip["amount_cents"],
+                    "amount_cents": allocations[operator_id],
+                    "prior_amount_cents": 0,
+                    "cumulative_amount_cents": allocations[operator_id],
+                    "bp": bp_by_operator[operator_id],
+                })
+        entries.sort(key=lambda e: (e["ended_at"], e["trip_id"], e["operator_id"]))
+
+        net_total = sum(e["amount_cents"] for e in entries)
+        db.conn.execute(
+            "INSERT INTO clearing_batches (clearing_id, root_clearing_id, seq, kind,"
+            " payload_hash, window_start, window_end, rules, base_clearing_id,"
+            " trip_count, reversed_trip_count, ledger_row_count, gross_amount_cents,"
+            " net_amount_cents, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                body.clearing_id, body.clearing_id, 0, "initial",
+                p_hash, iso_str(window_start), iso_str(window_end),
+                canonical_json(rules), None,
+                len(trips), 0, len(entries), gross_total, net_total, created_at,
+            ),
+        )
+        db.conn.executemany(
+            "INSERT INTO clearing_entries (clearing_id, seq, trip_id, passenger_id,"
+            " from_station, to_station, ended_at, operator_id, basis_points,"
+            " gross_amount_cents, amount_cents, prior_amount_cents,"
+            " cumulative_amount_cents) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [
+                (
+                    body.clearing_id, seq, e["trip_id"], e["passenger_id"],
+                    e["from_station"], e["to_station"], e["ended_at"],
+                    e["operator_id"], e["bp"], e["gross_amount_cents"],
+                    e["amount_cents"], e["prior_amount_cents"],
+                    e["cumulative_amount_cents"],
+                )
+                for seq, e in enumerate(entries)
+            ],
+        )
+        response = _load_clearing(db, body.clearing_id, "created")
+        append_audit(db.conn, "clearing_closed", canonical_payload, response.model_dump())
+
+    return response
+
+
+@app.post("/clearings/adjustments", response_model=ClearingBatchOut, status_code=200)
+def create_clearing_adjustment(
+    body: ClearingAdjustmentIn,
+    db: Database = Depends(get_db),
+) -> ClearingBatchOut:
+    """Follow-up batch after tap corrections. The first closing's frozen
+    window and rules still apply: target per-operator amounts are split from
+    the current charges and reduced by everything already booked, so only
+    signed deltas (including full reversals of vanished trips) are appended."""
+    canonical_payload = canonical_adjustment_payload(
+        body.clearing_id, body.base_clearing_id
+    )
+    p_hash = clearing_payload_hash(canonical_payload)
+
+    with db.lock(), db.conn:
+        existing = db.conn.execute(
+            "SELECT payload_hash FROM clearing_batches WHERE clearing_id = ?",
+            (body.clearing_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing["payload_hash"] != p_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"clearing_id '{body.clearing_id}' already exists with a"
+                        " different payload"
+                    ),
+                )
+            return _load_clearing(db, body.clearing_id, "duplicate")
+
+        root = db.conn.execute(
+            "SELECT * FROM clearing_batches WHERE clearing_id = ?",
+            (body.base_clearing_id,),
+        ).fetchone()
+        if root is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"base_clearing_id '{body.base_clearing_id}' not found; run"
+                    " POST /clearings for the first closing first"
+                ),
+            )
+        if root["kind"] != "initial" or root["seq"] != 0:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"base_clearing_id '{body.base_clearing_id}' is an adjustment"
+                    " batch; adjustments must reference the first closing"
+                ),
+            )
+
+        window_start = normalize_ts(
+            datetime.fromisoformat(root["window_start"].replace("Z", "+00:00"))
+        )
+        window_end = normalize_ts(
+            datetime.fromisoformat(root["window_end"].replace("Z", "+00:00"))
+        )
+        rules = json.loads(root["rules"])
+        rules_by_pair = rule_map_from_canonical(rules)
+
+        next_seq = db.conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM clearing_batches"
+            " WHERE root_clearing_id = ?",
+            (body.base_clearing_id,),
+        ).fetchone()[0]
+        prior = prior_operator_totals(db.conn, body.base_clearing_id, next_seq)
+        seen_before = last_seen_trips(db.conn, body.base_clearing_id, next_seq)
+
+        current_trips = load_clearing_trips(db.conn, window_start, window_end)
+        missing = sorted(
+            {f"{t['from_station']}->{t['to_station']}"
+             for t in current_trips
+             if (t["from_station"], t["to_station"]) not in rules_by_pair}
+        )
+        if missing:
+            # The first closing's rules stay frozen; a correction must never
+            # leave a current trip outside their coverage. Open a new first
+            # closing (with new rules) instead.
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "no matching frozen operator rule for current in-window trip"
+                    f" station pair(s): {missing}; the first closing's rules are"
+                    " immutable -- open a new first closing with a new clearing_id"
+                    " to settle under different rules"
+                ),
+            )
+
+        current_ids = {t["trip_id"] for t in current_trips}
+        vanished_ids = sorted(set(seen_before) - current_ids)
+
+        entries: list[dict] = []
+        gross_total = 0
+        reversed_count = 0
+        prior_ops_by_trip: dict[str, set[str]] = {}
+        for (tid, op) in prior:
+            prior_ops_by_trip.setdefault(tid, set()).add(op)
+        for trip in current_trips:
+            shares = rules_by_pair[(trip["from_station"], trip["to_station"])]
+            targets = split_amount(trip["amount_cents"], shares)
+            gross_total += trip["amount_cents"]
+            # Include operators booked under the trip's previous station pair:
+            # a correction can move the same trip_id onto a different pair with
+            # a different operator set, and the operators dropped by the new
+            # rule must be reversed to zero (target 0) rather than left booked.
+            all_operators = {op for op, _bp in shares} | prior_ops_by_trip.get(
+                trip["trip_id"], set()
+            )
+            for operator_id in sorted(all_operators):
+                prev_amount = prior.get((trip["trip_id"], operator_id), 0)
+                target = targets.get(operator_id, 0)
+                delta = target - prev_amount
+                if delta == 0:
+                    continue
+                entries.append({
+                    "trip_id": trip["trip_id"],
+                    "passenger_id": trip["passenger_id"],
+                    "from_station": trip["from_station"],
+                    "to_station": trip["to_station"],
+                    "ended_at": trip["ended_at"],
+                    "operator_id": operator_id,
+                    "basis_points": None,
+                    "gross_amount_cents": trip["amount_cents"],
+                    "amount_cents": delta,
+                    "prior_amount_cents": prev_amount,
+                    "cumulative_amount_cents": prev_amount + delta,
+                })
+        for trip_id in vanished_ids:
+            last = seen_before[trip_id]
+            # Reverse whatever earlier batches booked, per operator, so the
+            # disappeared trip nets to zero.
+            operators = sorted(
+                op for (tid, op) in prior if tid == trip_id and prior[(tid, op)] != 0
+            )
+            if operators:
+                reversed_count += 1
+            for operator_id in operators:
+                prev_amount = prior[(trip_id, operator_id)]
+                entries.append({
+                    "trip_id": trip_id,
+                    "passenger_id": last["passenger_id"],
+                    "from_station": last["from_station"],
+                    "to_station": last["to_station"],
+                    "ended_at": last["ended_at"],
+                    "operator_id": operator_id,
+                    "basis_points": None,
+                    "gross_amount_cents": 0,
+                    "amount_cents": -prev_amount,
+                    "prior_amount_cents": prev_amount,
+                    "cumulative_amount_cents": 0,
+                })
+        entries.sort(key=lambda e: (e["ended_at"], e["trip_id"], e["operator_id"]))
+
+        net_total = sum(e["amount_cents"] for e in entries)
+        created_at = iso_str(datetime.now(timezone.utc))
+        # Batch row and its immutable delta rows commit together, in the same
+        # transaction as the audit record.
+        db.conn.execute(
+            "INSERT INTO clearing_batches (clearing_id, root_clearing_id, seq, kind,"
+            " payload_hash, window_start, window_end, rules, base_clearing_id,"
+            " trip_count, reversed_trip_count, ledger_row_count, gross_amount_cents,"
+            " net_amount_cents, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                body.clearing_id, body.base_clearing_id, next_seq, "adjustment",
+                p_hash, iso_str(window_start), iso_str(window_end),
+                root["rules"], body.base_clearing_id,
+                len(current_trips), reversed_count, len(entries),
+                gross_total, net_total, created_at,
+            ),
+        )
+        db.conn.executemany(
+            "INSERT INTO clearing_entries (clearing_id, seq, trip_id, passenger_id,"
+            " from_station, to_station, ended_at, operator_id, basis_points,"
+            " gross_amount_cents, amount_cents, prior_amount_cents,"
+            " cumulative_amount_cents) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [
+                (
+                    body.clearing_id, seq, e["trip_id"], e["passenger_id"],
+                    e["from_station"], e["to_station"], e["ended_at"],
+                    e["operator_id"], e["basis_points"], e["gross_amount_cents"],
+                    e["amount_cents"], e["prior_amount_cents"],
+                    e["cumulative_amount_cents"],
+                )
+                for seq, e in enumerate(entries)
+            ],
+        )
+        response = _load_clearing(db, body.clearing_id, "created")
+        append_audit(db.conn, "clearing_closed", canonical_payload, response.model_dump())
+
+    return response
+
+
+@app.get("/clearings/{clearing_id}", response_model=ClearingBatchOut)
+def get_clearing(
+    clearing_id: str,
+    db: Database = Depends(get_db),
+) -> ClearingBatchOut:
+    with db.lock():
+        # The replay marker only appears on POST responses; a stored batch is
+        # always reported as "created", while the frozen window/rules and the
+        # chain-wide operator positions are returned as they stand now.
+        return _load_clearing(db, clearing_id, "created")
+
+
+# ---------------------------------------------------------------------------
 # Tap-event quality scans (read-only analysis, isolated append-only tables)
 # ---------------------------------------------------------------------------
 
@@ -1436,7 +1850,7 @@ def list_audit(
         default=None,
         pattern="^(event_processed|event_corrected|recon_batch_created"
                 "|network_validated|network_snapshot_created"
-                "|dispute_opened|dispute_resolved)$",
+                "|dispute_opened|dispute_resolved|clearing_closed)$",
         description="Filter by operation type",
     ),
     after: int = Query(default=0, ge=0, description="Return records with seq > after"),
